@@ -1,0 +1,3 @@
+/Users/zhao/github/memcached-1.5.11/cmake-build-debug/CMakeFiles/rebuild_cache.dir
+/Users/zhao/github/memcached-1.5.11/cmake-build-debug/CMakeFiles/edit_cache.dir
+/Users/zhao/github/memcached-1.5.11/cmake-build-debug/CMakeFiles/demo.dir
