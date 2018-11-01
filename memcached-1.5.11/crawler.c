@@ -545,7 +545,7 @@ static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
         crawlers[sid].reclaimed = 0;
         crawlers[sid].unfetched = 0;
         crawlers[sid].checked = 0;
-        do_item_linktail_q((item *)&crawlers[sid]);
+       // do_item_linktail_q((item *)&crawlers[sid]);
         crawler_count++;
         starts++;
     }

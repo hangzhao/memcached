@@ -51,11 +51,15 @@ typedef struct {
     rel_time_t evicted_time;
 } itemstats_t;
 
-static item *heads[LARGEST_ID];
-static item *tails[LARGEST_ID];
-static itemstats_t itemstats[LARGEST_ID];
-static unsigned int sizes[LARGEST_ID];
-static uint64_t sizes_bytes[LARGEST_ID];
+//LRU 链表的头和尾，引入命名空间机制后，每一个命名空间都有自己的LRU链表头和尾
+
+//LARGEST_ID = 256，slab_class数量是64，再乘以每一个slab_class都有 hot, warm, cold, noexp四个LRU队列，
+//因此是64*4 = 256
+static item *heads[NUMBER_OF_NAME_SPACES][LARGEST_ID];
+static item *tails[NUMBER_OF_NAME_SPACES][LARGEST_ID];
+static itemstats_t itemstats[NUMBER_OF_NAME_SPACES][LARGEST_ID];
+static unsigned int sizes[NUMBER_OF_NAME_SPACES][LARGEST_ID];
+static uint64_t sizes_bytes[NUMBER_OF_NAME_SPACES][LARGEST_ID];
 static unsigned int *stats_sizes_hist = NULL;
 static uint64_t stats_sizes_cas_min = 0;
 static int stats_sizes_buckets = 0;
@@ -78,9 +82,9 @@ void item_stats_reset(void) {
 /* called with class lru lock held */
 void do_item_stats_add_crawl(const int i, const uint64_t reclaimed,
         const uint64_t unfetched, const uint64_t checked) {
-    itemstats[i].crawler_reclaimed += reclaimed;
-    itemstats[i].expired_unfetched += unfetched;
-    itemstats[i].crawler_items_checked += checked;
+    itemstats[0][i].crawler_reclaimed += reclaimed;
+    itemstats[0][i].expired_unfetched += unfetched;
+    itemstats[0][i].crawler_items_checked += checked;
 }
 
 typedef struct _lru_bump_buf {
@@ -133,14 +137,14 @@ static unsigned int temp_lru_size(int slabs_clsid) {
     id |= TEMP_LRU;
     unsigned int ret;
     pthread_mutex_lock(&lru_locks[id]);
-    ret = sizes_bytes[id];
+    ret = sizes_bytes[0][id];
     pthread_mutex_unlock(&lru_locks[id]);
     return ret;
 }
 
 /* must be locked before call */
 unsigned int do_get_lru_size(uint32_t id) {
-    return sizes[id];
+    return sizes[0][id];
 }
 
 /* Enable this for reference-count debugging. */
@@ -181,7 +185,7 @@ static size_t item_make_header(const uint8_t nkey, const unsigned int flags, con
     return sizeof(item) + nkey + *nsuffix + nbytes;
 }
 
-item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
+item *do_item_alloc_pull(const size_t ntotal, const unsigned int id, const int namespace_key) {
     item *it = NULL;
     int i;
     /* If no memory is available, attempt a direct LRU juggle/eviction */
@@ -194,17 +198,17 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
         uint64_t total_bytes;
         /* Try to reclaim memory first */
         if (!settings.lru_segmented) {
-            lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
+            lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL, namespace_key);
         }
-        it = slabs_alloc(ntotal, id, &total_bytes, 0);
+        it = slabs_alloc(ntotal, id, &total_bytes, 0, namespace_key);
 
         if (settings.temp_lru)
             total_bytes -= temp_lru_size(id);
 
         if (it == NULL) {
-            if (lru_pull_tail(id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL) <= 0) {
+            if (lru_pull_tail(id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL, namespace_key) <= 0) {
                 if (settings.lru_segmented) {
-                    lru_pull_tail(id, HOT_LRU, total_bytes, 0, 0, NULL);
+                    lru_pull_tail(id, HOT_LRU, total_bytes, 0, 0, NULL, namespace_key);
                 } else {
                     break;
                 }
@@ -216,7 +220,7 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
 
     if (i > 0) {
         pthread_mutex_lock(&lru_locks[id]);
-        itemstats[id].direct_reclaims += i;
+        itemstats[namespace_key][id].direct_reclaims += i;
         pthread_mutex_unlock(&lru_locks[id]);
     }
 
@@ -228,14 +232,14 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
  * flag, it counts as busy and skips.
  * I think it might still not be safe to do linking outside of the slab lock
  */
-item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain) {
+item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain, const int namespace_key) {
     // TODO: Should be a cleaner way of finding real size with slabber calls
     size_t size = bytes_remain + sizeof(item_chunk);
     if (size > settings.slab_chunk_size_max)
         size = settings.slab_chunk_size_max;
     unsigned int id = slabs_clsid(size);
 
-    item_chunk *nch = (item_chunk *) do_item_alloc_pull(size, id);
+    item_chunk *nch = (item_chunk *) do_item_alloc_pull(size, id, namespace_key);
     if (nch == NULL)
         return NULL;
 
@@ -255,7 +259,7 @@ item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain) {
 }
 
 item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
-                    const rel_time_t exptime, const int nbytes) {
+                    const rel_time_t exptime, const int nbytes, const int namespace_key) {
     uint8_t nsuffix;
     item *it = NULL;
     char suffix[40];
@@ -293,17 +297,17 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         }
 #endif
         hdr_id = slabs_clsid(htotal);
-        it = do_item_alloc_pull(htotal, hdr_id);
+        it = do_item_alloc_pull(htotal, hdr_id, namespace_key);
         /* setting ITEM_CHUNKED is fine here because we aren't LINKED yet. */
         if (it != NULL)
             it->it_flags |= ITEM_CHUNKED;
     } else {
-        it = do_item_alloc_pull(ntotal, id);
+        it = do_item_alloc_pull(ntotal, id, namespace_key);
     }
 
     if (it == NULL) {
         pthread_mutex_lock(&lru_locks[id]);
-        itemstats[id].outofmemory++;
+        itemstats[it->namespace_key][id].outofmemory++;
         pthread_mutex_unlock(&lru_locks[id]);
         return NULL;
     }
@@ -361,14 +365,14 @@ void item_free(item *it) {
     size_t ntotal = ITEM_ntotal(it);
     unsigned int clsid;
     assert((it->it_flags & ITEM_LINKED) == 0);
-    assert(it != heads[it->slabs_clsid]);
-    assert(it != tails[it->slabs_clsid]);
+    assert(it != heads[it->namespace_key][it->slabs_clsid]);
+    assert(it != tails[it->namespace_key][it->slabs_clsid]);
     assert(it->refcount == 0);
 
     /* so slab size changer can tell later if item is already free or not */
     clsid = ITEM_clsid(it);
     DEBUG_REFCNT(it, 'F');
-    slabs_free(it, ntotal, clsid);
+    slabs_free(it, ntotal, clsid, it->namespace_key);
 }
 
 /**
@@ -394,8 +398,8 @@ static void do_item_link_q(item *it) { /* item is the new head */
     item **head, **tail;
     assert((it->it_flags & ITEM_SLABBED) == 0);
 
-    head = &heads[it->slabs_clsid];
-    tail = &tails[it->slabs_clsid];
+    head = &heads[it->namespace_key][it->slabs_clsid];
+    tail = &tails[it->namespace_key][it->slabs_clsid];
     assert(it != *head);
     assert((*head && *tail) || (*head == 0 && *tail == 0));
     it->prev = 0;
@@ -403,7 +407,7 @@ static void do_item_link_q(item *it) { /* item is the new head */
     if (it->next) it->next->prev = it;
     *head = it;
     if (*tail == 0) *tail = it;
-    sizes[it->slabs_clsid]++;
+    sizes[it->namespace_key][it->slabs_clsid]++;
 #ifdef EXTSTORE
     if (it->it_flags & ITEM_HDR) {
         sizes_bytes[it->slabs_clsid] += (ITEM_ntotal(it) - it->nbytes) + sizeof(item_hdr);
@@ -411,7 +415,7 @@ static void do_item_link_q(item *it) { /* item is the new head */
         sizes_bytes[it->slabs_clsid] += ITEM_ntotal(it);
     }
 #else
-    sizes_bytes[it->slabs_clsid] += ITEM_ntotal(it);
+    sizes_bytes[it->namespace_key][it->slabs_clsid] += ITEM_ntotal(it);
 #endif
 
     return;
@@ -426,14 +430,14 @@ static void item_link_q(item *it) {
 static void item_link_q_warm(item *it) {
     pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_link_q(it);
-    itemstats[it->slabs_clsid].moves_to_warm++;
+    itemstats[it->namespace_key][it->slabs_clsid].moves_to_warm++;
     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
 
 static void do_item_unlink_q(item *it) {
     item **head, **tail;
-    head = &heads[it->slabs_clsid];
-    tail = &tails[it->slabs_clsid];
+    head = &heads[it->namespace_key][it->slabs_clsid];
+    tail = &tails[it->namespace_key][it->slabs_clsid];
 
     if (*head == it) {
         assert(it->prev == 0);
@@ -448,7 +452,7 @@ static void do_item_unlink_q(item *it) {
 
     if (it->next) it->next->prev = it->prev;
     if (it->prev) it->prev->next = it->next;
-    sizes[it->slabs_clsid]--;
+    sizes[it->namespace_key][it->slabs_clsid]--;
 #ifdef EXTSTORE
     if (it->it_flags & ITEM_HDR) {
         sizes_bytes[it->slabs_clsid] -= (ITEM_ntotal(it) - it->nbytes) + sizeof(item_hdr);
@@ -456,7 +460,7 @@ static void do_item_unlink_q(item *it) {
         sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
     }
 #else
-    sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
+    sizes_bytes[it->namespace_key][it->slabs_clsid] -= ITEM_ntotal(it);
 #endif
 
     return;
@@ -475,9 +479,14 @@ int do_item_link(item *it, const uint32_t hv) {
     it->time = current_time;
 
     STATS_LOCK();
+    //总体的状态统计
     stats_state.curr_bytes += ITEM_ntotal(it);
     stats_state.curr_items += 1;
     stats.total_items += 1;
+    //当前命名空间的状态统计
+    namespace_stats_state[it->namespace_key].curr_bytes += ITEM_ntotal(it);
+    namespace_stats_state[it->namespace_key].curr_items += 1;
+    namespace_stats[it->namespace_key].total_items += 1;
     STATS_UNLOCK();
 
     /* Allocate a new CAS ID on link. */
@@ -605,7 +614,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     id |= COLD_LRU;
 
     pthread_mutex_lock(&lru_locks[id]);
-    it = heads[id];
+    it = heads[0][id];
 
     buffer = malloc((size_t)memlimit);
     if (buffer == 0) {
@@ -645,7 +654,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
 /* With refactoring of the various stats code the automover won't need a
  * custom function here.
  */
-void fill_item_stats_automove(item_stats_automove *am) {
+void fill_item_stats_automove(item_stats_automove *am, const int namespace_key) {
     int n;
     for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
         item_stats_automove *cur = &am[n];
@@ -653,15 +662,15 @@ void fill_item_stats_automove(item_stats_automove *am) {
         // outofmemory records into HOT
         int i = n | HOT_LRU;
         pthread_mutex_lock(&lru_locks[i]);
-        cur->outofmemory = itemstats[i].outofmemory;
+        cur->outofmemory = itemstats[0][i].outofmemory;
         pthread_mutex_unlock(&lru_locks[i]);
 
         // evictions and tail age are from COLD
         i = n | COLD_LRU;
         pthread_mutex_lock(&lru_locks[i]);
-        cur->evicted = itemstats[i].evicted;
-        if (tails[i]) {
-            cur->age = current_time - tails[i]->time;
+        cur->evicted = itemstats[0][i].evicted;
+        if (tails[0][i]) {
+            cur->age = current_time - tails[0][i]->time;
         } else {
             cur->age = 0;
         }
@@ -679,18 +688,20 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
             pthread_mutex_lock(&lru_locks[i]);
-            totals.expired_unfetched += itemstats[i].expired_unfetched;
-            totals.evicted_unfetched += itemstats[i].evicted_unfetched;
-            totals.evicted_active += itemstats[i].evicted_active;
-            totals.evicted += itemstats[i].evicted;
-            totals.reclaimed += itemstats[i].reclaimed;
-            totals.crawler_reclaimed += itemstats[i].crawler_reclaimed;
-            totals.crawler_items_checked += itemstats[i].crawler_items_checked;
-            totals.lrutail_reflocked += itemstats[i].lrutail_reflocked;
-            totals.moves_to_cold += itemstats[i].moves_to_cold;
-            totals.moves_to_warm += itemstats[i].moves_to_warm;
-            totals.moves_within_lru += itemstats[i].moves_within_lru;
-            totals.direct_reclaims += itemstats[i].direct_reclaims;
+            for (int j = 0; j < NUMBER_OF_NAME_SPACES; j++) {
+            totals.expired_unfetched += itemstats[j][i].expired_unfetched;
+            totals.evicted_unfetched += itemstats[j][i].evicted_unfetched;
+            totals.evicted_active += itemstats[j][i].evicted_active;
+            totals.evicted += itemstats[j][i].evicted;
+            totals.reclaimed += itemstats[j][i].reclaimed;
+            totals.crawler_reclaimed += itemstats[j][i].crawler_reclaimed;
+            totals.crawler_items_checked += itemstats[j][i].crawler_items_checked;
+            totals.lrutail_reflocked += itemstats[j][i].lrutail_reflocked;
+            totals.moves_to_cold += itemstats[j][i].moves_to_cold;
+            totals.moves_to_warm += itemstats[j][i].moves_to_warm;
+            totals.moves_within_lru += itemstats[j][i].moves_within_lru;
+            totals.direct_reclaims += itemstats[j][i].direct_reclaims;
+        }
             pthread_mutex_unlock(&lru_locks[i]);
         }
     }
@@ -747,32 +758,34 @@ void item_stats(ADD_STAT add_stats, void *c) {
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
             pthread_mutex_lock(&lru_locks[i]);
-            totals.evicted += itemstats[i].evicted;
-            totals.evicted_nonzero += itemstats[i].evicted_nonzero;
-            totals.outofmemory += itemstats[i].outofmemory;
-            totals.tailrepairs += itemstats[i].tailrepairs;
-            totals.reclaimed += itemstats[i].reclaimed;
-            totals.expired_unfetched += itemstats[i].expired_unfetched;
-            totals.evicted_unfetched += itemstats[i].evicted_unfetched;
-            totals.evicted_active += itemstats[i].evicted_active;
-            totals.crawler_reclaimed += itemstats[i].crawler_reclaimed;
-            totals.crawler_items_checked += itemstats[i].crawler_items_checked;
-            totals.lrutail_reflocked += itemstats[i].lrutail_reflocked;
-            totals.moves_to_cold += itemstats[i].moves_to_cold;
-            totals.moves_to_warm += itemstats[i].moves_to_warm;
-            totals.moves_within_lru += itemstats[i].moves_within_lru;
-            totals.direct_reclaims += itemstats[i].direct_reclaims;
-            size += sizes[i];
-            lru_size_map[x] = sizes[i];
-            if (lru_type_map[x] == COLD_LRU && tails[i] != NULL) {
-                age = current_time - tails[i]->time;
-            } else if (lru_type_map[x] == HOT_LRU && tails[i] != NULL) {
-                age_hot = current_time - tails[i]->time;
-            } else if (lru_type_map[x] == WARM_LRU && tails[i] != NULL) {
-                age_warm = current_time - tails[i]->time;
+            for(int j=0; j < NUMBER_OF_NAME_SPACES; j++) {
+                totals.evicted += itemstats[j][i].evicted;
+                totals.evicted_nonzero += itemstats[j][i].evicted_nonzero;
+                totals.outofmemory += itemstats[j][i].outofmemory;
+                totals.tailrepairs += itemstats[j][i].tailrepairs;
+                totals.reclaimed += itemstats[j][i].reclaimed;
+                totals.expired_unfetched += itemstats[j][i].expired_unfetched;
+                totals.evicted_unfetched += itemstats[j][i].evicted_unfetched;
+                totals.evicted_active += itemstats[j][i].evicted_active;
+                totals.crawler_reclaimed += itemstats[j][i].crawler_reclaimed;
+                totals.crawler_items_checked += itemstats[j][i].crawler_items_checked;
+                totals.lrutail_reflocked += itemstats[j][i].lrutail_reflocked;
+                totals.moves_to_cold += itemstats[j][i].moves_to_cold;
+                totals.moves_to_warm += itemstats[j][i].moves_to_warm;
+                totals.moves_within_lru += itemstats[j][i].moves_within_lru;
+                totals.direct_reclaims += itemstats[j][i].direct_reclaims;
+                size += sizes[j][i];
+                lru_size_map[x] = sizes[j][i];
+                if (lru_type_map[x] == COLD_LRU && tails[j][i] != NULL) {
+                    age = current_time - tails[j][i]->time;
+                } else if (lru_type_map[x] == HOT_LRU && tails[j][i] != NULL) {
+                    age_hot = current_time - tails[j][i]->time;
+                } else if (lru_type_map[x] == WARM_LRU && tails[j][i] != NULL) {
+                    age_warm = current_time - tails[j][i]->time;
+                }
+                if (lru_type_map[x] == COLD_LRU)
+                    totals.evicted_time = itemstats[j][i].evicted_time;
             }
-            if (lru_type_map[x] == COLD_LRU)
-                totals.evicted_time = itemstats[i].evicted_time;
             switch (lru_type_map[x]) {
                 case HOT_LRU:
                     totals.hits_to_hot = thread_stats.lru_hits[i];
@@ -1071,7 +1084,7 @@ item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
  * Callable from worker threads or the LRU maintainer thread */
 int lru_pull_tail(const int orig_id, const int cur_lru,
         const uint64_t total_bytes, const uint8_t flags, const rel_time_t max_age,
-        struct lru_pull_tail_return *ret_it) {
+        struct lru_pull_tail_return *ret_it, const int  namespace_key) {
     item *it = NULL;
     int id = orig_id;
     int removed = 0;
@@ -1087,7 +1100,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
 
     id |= cur_lru;
     pthread_mutex_lock(&lru_locks[id]);
-    search = tails[id];
+    search = tails[namespace_key][id];
     /* We walk up *only* for locked items, and if bottom is expired. */
     for (; tries > 0 && search != NULL; tries--, search=next_it) {
         /* we might relink search mid-loop, so search->prev isn't reliable */
@@ -1110,12 +1123,12 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
         if (refcount_incr(search) != 2) {
             /* Note pathological case with ref'ed items in tail.
              * Can still unlink the item, but it won't be reusable yet */
-            itemstats[id].lrutail_reflocked++;
+            itemstats[namespace_key][id].lrutail_reflocked++;
             /* In case of refcount leaks, enable for quick workaround. */
             /* WARNING: This can cause terrible corruption */
             if (settings.tail_repair_time &&
                     search->time + settings.tail_repair_time < current_time) {
-                itemstats[id].tailrepairs++;
+                itemstats[namespace_key][id].tailrepairs++;
                 search->refcount = 1;
                 /* This will call item_remove -> item_free since refcnt is 1 */
                 STORAGE_delete(ext_storage, search);
@@ -1128,9 +1141,9 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
         /* Expired or flushed */
         if ((search->exptime != 0 && search->exptime < current_time)
             || item_is_flushed(search)) {
-            itemstats[id].reclaimed++;
+            itemstats[namespace_key][id].reclaimed++;
             if ((search->it_flags & ITEM_FETCHED) == 0) {
-                itemstats[id].expired_unfetched++;
+                itemstats[namespace_key][id].expired_unfetched++;
             }
             /* refcnt 2 -> 1 */
             do_item_unlink_nolock(search, hv);
@@ -1158,20 +1171,20 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                     search->it_flags &= ~ITEM_ACTIVE;
                     removed++;
                     if (cur_lru == WARM_LRU) {
-                        itemstats[id].moves_within_lru++;
+                        itemstats[namespace_key][id].moves_within_lru++;
                         do_item_update_nolock(search);
                         do_item_remove(search);
                         item_trylock_unlock(hold_lock);
                     } else {
                         /* Active HOT_LRU items flow to WARM */
-                        itemstats[id].moves_to_warm++;
+                        itemstats[namespace_key][id].moves_to_warm++;
                         move_to_lru = WARM_LRU;
                         do_item_unlink_q(search);
                         it = search;
                     }
-                } else if (sizes_bytes[id] > limit ||
+                } else if (sizes_bytes[namespace_key][id] > limit ||
                            current_time - search->time > max_age) {
-                    itemstats[id].moves_to_cold++;
+                    itemstats[namespace_key][id].moves_to_cold++;
                     move_to_lru = COLD_LRU;
                     do_item_unlink_q(search);
                     it = search;
@@ -1189,15 +1202,15 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                         /* Don't think we need a counter for this. It'll OOM.  */
                         break;
                     }
-                    itemstats[id].evicted++;
-                    itemstats[id].evicted_time = current_time - search->time;
+                    itemstats[namespace_key][id].evicted++;
+                    itemstats[namespace_key][id].evicted_time = current_time - search->time;
                     if (search->exptime != 0)
-                        itemstats[id].evicted_nonzero++;
+                        itemstats[namespace_key][id].evicted_nonzero++;
                     if ((search->it_flags & ITEM_FETCHED) == 0) {
-                        itemstats[id].evicted_unfetched++;
+                        itemstats[namespace_key][id].evicted_unfetched++;
                     }
                     if ((search->it_flags & ITEM_ACTIVE)) {
-                        itemstats[id].evicted_active++;
+                        itemstats[namespace_key][id].evicted_active++;
                     }
                     LOGGER_LOG(NULL, LOG_EVICTIONS, LOGGER_EVICTION, search);
                     STORAGE_delete(ext_storage, search);
@@ -1212,7 +1225,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                     ret_it->hv = hv;
                 } else if ((search->it_flags & ITEM_ACTIVE) != 0
                         && settings.lru_segmented) {
-                    itemstats[id].moves_to_warm++;
+                    itemstats[namespace_key][id].moves_to_warm++;
                     search->it_flags &= ~ITEM_ACTIVE;
                     move_to_lru = WARM_LRU;
                     do_item_unlink_q(search);
@@ -1370,11 +1383,11 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     //unsigned int chunks_free = 0;
     /* TODO: if free_chunks below high watermark, increase aggressiveness */
     slabs_available_chunks(slabs_clsid, NULL,
-            &total_bytes, &chunks_perslab);
+            &total_bytes, &chunks_perslab, 0);
     if (settings.temp_lru) {
         /* Only looking for reclaims. Run before we size the LRU. */
         for (i = 0; i < 500; i++) {
-            if (lru_pull_tail(slabs_clsid, TEMP_LRU, 0, 0, 0, NULL) <= 0) {
+            if (lru_pull_tail(slabs_clsid, TEMP_LRU, 0, 0, 0, NULL, 0) <= 0) {
                 break;
             } else {
                 did_moves++;
@@ -1389,8 +1402,8 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     /* If LRU is in flat mode, force items to drain into COLD via max age */
     if (settings.lru_segmented) {
         pthread_mutex_lock(&lru_locks[slabs_clsid|COLD_LRU]);
-        if (tails[slabs_clsid|COLD_LRU]) {
-            cold_age = current_time - tails[slabs_clsid|COLD_LRU]->time;
+        if (tails[0][slabs_clsid|COLD_LRU]) {
+            cold_age = current_time - tails[0][slabs_clsid|COLD_LRU]->time;
         }
         pthread_mutex_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
         hot_age = cold_age * settings.hot_max_factor;
@@ -1400,12 +1413,12 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     /* Juggle HOT/WARM up to N times */
     for (i = 0; i < 500; i++) {
         int do_more = 0;
-        if (lru_pull_tail(slabs_clsid, HOT_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, hot_age, NULL) ||
-            lru_pull_tail(slabs_clsid, WARM_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, warm_age, NULL)) {
+        if (lru_pull_tail(slabs_clsid, HOT_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, hot_age, NULL, 0) ||
+            lru_pull_tail(slabs_clsid, WARM_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, warm_age, NULL, 0)) {
             do_more++;
         }
         if (settings.lru_segmented) {
-            do_more += lru_pull_tail(slabs_clsid, COLD_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, 0, NULL);
+            do_more += lru_pull_tail(slabs_clsid, COLD_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, 0, NULL, 0);
         }
         if (do_more == 0)
             break;
@@ -1505,8 +1518,8 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
         }
         if (current_time > next_crawls[i]) {
             pthread_mutex_lock(&lru_locks[i]);
-            if (sizes[i] > tocrawl_limit) {
-                tocrawl_limit = sizes[i];
+            if (sizes[0][i] > tocrawl_limit) {
+                tocrawl_limit = sizes[0][i];
             }
             pthread_mutex_unlock(&lru_locks[i]);
             todo[i] = 1;
@@ -1715,8 +1728,8 @@ void do_item_linktail_q(item *it) { /* item is the new tail */
     assert(it->it_flags == 1);
     assert(it->nbytes == 0);
 
-    head = &heads[it->slabs_clsid];
-    tail = &tails[it->slabs_clsid];
+    head = &heads[it->namespace_key][it->slabs_clsid];
+    tail = &tails[it->namespace_key][it->slabs_clsid];
     //assert(*tail != 0);
     assert(it != *tail);
     assert((*head && *tail) || (*head == 0 && *tail == 0));
@@ -1733,8 +1746,8 @@ void do_item_linktail_q(item *it) { /* item is the new tail */
 
 void do_item_unlinktail_q(item *it) {
     item **head, **tail;
-    head = &heads[it->slabs_clsid];
-    tail = &tails[it->slabs_clsid];
+    head = &heads[it->namespace_key][it->slabs_clsid];
+    tail = &tails[it->namespace_key][it->slabs_clsid];
 
     if (*head == it) {
         assert(it->prev == 0);
@@ -1758,8 +1771,8 @@ item *do_item_crawl_q(item *it) {
     item **head, **tail;
     assert(it->it_flags == 1);
     assert(it->nbytes == 0);
-    head = &heads[it->slabs_clsid];
-    tail = &tails[it->slabs_clsid];
+    head = &heads[it->namespace_key][it->slabs_clsid];
+    tail = &tails[it->namespace_key][it->slabs_clsid];
 
     /* We've hit the head, pop off */
     if (it->prev == 0) {

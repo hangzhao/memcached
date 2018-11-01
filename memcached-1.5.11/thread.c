@@ -545,10 +545,10 @@ void sidethread_conn_close(conn *c) {
 /*
  * Allocates a new item.
  */
-item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
+item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes, const int namespace_key) {
     item *it;
     /* do_item_alloc handles its own locks */
-    it = do_item_alloc(key, nkey, flags, exptime, nbytes);
+    it = do_item_alloc(key, nkey, flags, exptime, nbytes, namespace_key);
     return it;
 }
 
@@ -629,13 +629,13 @@ void item_unlink(item *item) {
 enum delta_result_type add_delta(conn *c, const char *key,
                                  const size_t nkey, bool incr,
                                  const int64_t delta, char *buf,
-                                 uint64_t *cas) {
+                                 uint64_t *cas, const int namespace_key) {
     enum delta_result_type ret;
     uint32_t hv;
 
     hv = hash(key, nkey);
     item_lock(hv);
-    ret = do_add_delta(c, key, nkey, incr, delta, buf, cas, hv);
+    ret = do_add_delta(c, key, nkey, incr, delta, buf, cas, hv, namespace_key);
     item_unlock(hv);
     return ret;
 }

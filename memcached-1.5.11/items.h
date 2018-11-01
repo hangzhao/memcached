@@ -10,9 +10,10 @@
 uint64_t get_cas_id(void);
 
 /*@null@*/
-item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags, const rel_time_t exptime, const int nbytes);
-item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain);
-item *do_item_alloc_pull(const size_t ntotal, const unsigned int id);
+item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags, const rel_time_t exptime,
+        const int nbytes, const int namespace_key);
+item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain, const int namespace_key);
+item *do_item_alloc_pull(const size_t ntotal, const unsigned int id, const int namespace_key);
 void item_free(item *it);
 bool item_size_ok(const size_t nkey, const int flags, const int nbytes);
 
@@ -44,15 +45,25 @@ struct lru_pull_tail_return {
 
 int lru_pull_tail(const int orig_id, const int cur_lru,
         const uint64_t total_bytes, const uint8_t flags, const rel_time_t max_age,
-        struct lru_pull_tail_return *ret_it);
+        struct lru_pull_tail_return *ret_it, const int namespace_key);
 
 /*@null@*/
 char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
+/**
+ * stats items 命令专用
+ * @param add_stats
+ * @param c
+ */
 void item_stats(ADD_STAT add_stats, void *c);
 void do_item_stats_add_crawl(const int i, const uint64_t reclaimed,
         const uint64_t unfetched, const uint64_t checked);
 void item_stats_totals(ADD_STAT add_stats, void *c);
 /*@null@*/
+/**
+ * stats sizes命令专用
+ * @param add_stats
+ * @param c
+ */
 void item_stats_sizes(ADD_STAT add_stats, void *c);
 void item_stats_sizes_init(void);
 void item_stats_sizes_enable(ADD_STAT add_stats, void *c);
@@ -67,7 +78,7 @@ typedef struct {
     int64_t outofmemory;
     uint32_t age;
 } item_stats_automove;
-void fill_item_stats_automove(item_stats_automove *am);
+void fill_item_stats_automove(item_stats_automove *am, const int namespace_key);
 
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update);
 item *do_item_touch(const char *key, const size_t nkey, uint32_t exptime, const uint32_t hv, conn *c);

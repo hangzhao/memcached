@@ -45,9 +45,10 @@ void *slab_automove_init(struct settings *settings) {
     }
 
     // do a dry run to fill the before structs
-    fill_item_stats_automove(a->iam_before);
-    fill_slab_stats_automove(a->sam_before);
-
+    for(int namespace_key=0; namespace_key < NUMBER_OF_NAME_SPACES; namespace_key++){
+        fill_item_stats_automove(a->iam_before, namespace_key);
+        fill_slab_stats_automove(a->sam_before, namespace_key);
+    }
     return (void *)a;
 }
 
@@ -82,8 +83,10 @@ void slab_automove_run(void *arg, int *src, int *dst) {
     *dst = -1;
 
     // fill after structs
-    fill_item_stats_automove(a->iam_after);
-    fill_slab_stats_automove(a->sam_after);
+    for(int namespace_key=0; namespace_key< NUMBER_OF_NAME_SPACES; namespace_key++){
+        fill_item_stats_automove(a->iam_after, namespace_key);
+        fill_slab_stats_automove(a->sam_after, namespace_key);
+    }
     a->window_cur++;
 
     // iterate slabs

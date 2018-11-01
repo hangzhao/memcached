@@ -122,6 +122,8 @@ static void conn_free(conn *c);
 /** exported globals **/
 struct stats stats;
 struct stats_state stats_state;
+struct stats namespace_stats[NUMBER_OF_NAME_SPACES];
+struct stats_state namespace_stats_state[NUMBER_OF_NAME_SPACES];
 struct settings settings;
 time_t process_started;     /* when the process was started */
 conn **conns;
@@ -199,7 +201,12 @@ static rel_time_t realtime(const time_t exptime) {
 static void stats_init(void) {
     memset(&stats, 0, sizeof(struct stats));
     memset(&stats_state, 0, sizeof(struct stats_state));
-    stats_state.accepting_conns = true; /* assuming we start in this state. */
+    memset(&namespace_stats, 0, sizeof(struct stats) * NUMBER_OF_NAME_SPACES);
+    memset(&namespace_stats_state, 0, sizeof(struct stats_state) * NUMBER_OF_NAME_SPACES);
+    stats_state.accepting_conns = true;/* assuming we start in this state. */
+    for(int c=0; c < NUMBER_OF_NAME_SPACES; c++){
+        namespace_stats_state[c].accepting_conns =true;
+    }
 
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
@@ -1396,6 +1403,8 @@ static void complete_incr_bin(conn *c) {
     item *it;
     char *key;
     size_t nkey;
+    //命名空间的主键key
+    int namespace_key=0;
     /* Weird magic in add_delta forces me to pad here */
     char tmpbuf[INCR_MAX_STORAGE_LEN];
     uint64_t cas = 0;
@@ -1431,7 +1440,7 @@ static void complete_incr_bin(conn *c) {
     }
     switch(add_delta(c, key, nkey, c->cmd == PROTOCOL_BINARY_CMD_INCREMENT,
                      req->message.body.delta, tmpbuf,
-                     &cas)) {
+                     &cas, namespace_key)) {
     case OK:
         rsp->message.body.value = htonll(strtoull(tmpbuf, NULL, 10));
         if (cas) {
@@ -1455,7 +1464,7 @@ static void complete_incr_bin(conn *c) {
                 (unsigned long long)req->message.body.initial);
             int res = strlen(tmpbuf);
             it = item_alloc(key, nkey, 0, realtime(req->message.body.expiration),
-                            res + 2);
+                            res + 2, namespace_key);
 
             if (it != NULL) {
                 memcpy(ITEM_data(it), tmpbuf, res);
@@ -2050,6 +2059,7 @@ static void process_bin_sasl_auth(conn *c) {
 
     int nkey = c->binary_header.request.keylen;
     int vlen = c->binary_header.request.bodylen - nkey;
+    int namespace_key=0;
 
     if (nkey > MAX_SASL_MECH_LEN) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
@@ -2060,7 +2070,7 @@ static void process_bin_sasl_auth(conn *c) {
     char *key = binary_get_key(c);
     assert(key);
 
-    item *it = item_alloc(key, nkey, 0, 0, vlen+2);
+    item *it = item_alloc(key, nkey, 0, 0, vlen+2, namespace_key);
 
     /* Can't use a chunked item for SASL authentication. */
     if (it == 0 || (it->it_flags & ITEM_CHUNKED)) {
@@ -2394,6 +2404,7 @@ static void process_bin_update(conn *c) {
     char *key;
     int nkey;
     int vlen;
+    int namespace_key;
     item *it;
     protocol_binary_request_set* req = binary_get_request(c);
 
@@ -2401,6 +2412,8 @@ static void process_bin_update(conn *c) {
 
     key = binary_get_key(c);
     nkey = c->binary_header.request.keylen;
+    //bin 格式命令暂时不支持,namespace暂时用0补充
+    namespace_key=0;
 
     /* fix byteorder in the request */
     req->message.body.flags = ntohl(req->message.body.flags);
@@ -2430,7 +2443,7 @@ static void process_bin_update(conn *c) {
     }
 
     it = item_alloc(key, nkey, req->message.body.flags,
-            realtime(req->message.body.expiration), vlen+2);
+            realtime(req->message.body.expiration), vlen+2, namespace_key);
 
     if (it == 0) {
         enum store_item_type status;
@@ -2503,6 +2516,7 @@ static void process_bin_append_prepend(conn *c) {
     char *key;
     int nkey;
     int vlen;
+    int namespace_key;
     item *it;
 
     assert(c != NULL);
@@ -2510,6 +2524,7 @@ static void process_bin_append_prepend(conn *c) {
     key = binary_get_key(c);
     nkey = c->binary_header.request.keylen;
     vlen = c->binary_header.request.bodylen - nkey;
+    namespace_key = 0;
 
     if (settings.verbose > 1) {
         fprintf(stderr, "Value len is %d\n", vlen);
@@ -2519,7 +2534,7 @@ static void process_bin_append_prepend(conn *c) {
         stats_prefix_record_set(key, nkey);
     }
 
-    it = item_alloc(key, nkey, 0, 0, vlen+2);
+    it = item_alloc(key, nkey, 0, 0, vlen+2, namespace_key);
 
     if (it == 0) {
         if (! item_size_ok(nkey, 0, vlen + 2)) {
@@ -2746,7 +2761,7 @@ static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
             remain -= todo;
             assert(dch->used <= dch->size);
             if (dch->size == dch->used) {
-                item_chunk *tch = do_item_alloc_chunk(dch, remain);
+                item_chunk *tch = do_item_alloc_chunk(dch, remain, 0);
                 if (tch) {
                     dch = tch;
                 } else {
@@ -2773,7 +2788,7 @@ static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
             dch->used += todo;
             assert(dch->used <= dch->size);
             if (dch->size == dch->used) {
-                item_chunk *tch = do_item_alloc_chunk(dch, len - done);
+                item_chunk *tch = do_item_alloc_chunk(dch, len - done, 0);
                 if (tch) {
                     dch = tch;
                 } else {
@@ -2894,7 +2909,8 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                 /* we have it and old_it here - alloc memory to hold both */
                 /* flags was already lost - so recover them from ITEM_suffix(it) */
                 FLAGS_CONV(settings.inline_ascii_response, old_it, flags);
-                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
+                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime,
+                        it->nbytes + old_it->nbytes - 2 /* CRLF */, it->namespace_key);
 
                 /* copy data from it and old_it to new_it */
                 if (new_it == NULL || _store_item_copy_data(comm, old_it, new_it, it) == -1) {
@@ -2944,9 +2960,13 @@ typedef struct token_s {
 
 #define COMMAND_TOKEN 0
 #define SUBCOMMAND_TOKEN 1
+#define NAMESPACE_TOKEN 2
 #define KEY_TOKEN 1
 
-#define MAX_TOKENS 8
+/**
+ * 添加了命名空间机制，因此命令行中的参数数量由8增长到9
+ */
+#define MAX_TOKENS 9
 
 /*
  * Tokenize the command string by replacing whitespace with '\0' and update
@@ -3935,9 +3955,16 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 if (should_touch) {
                     c->thread->stats.touch_cmds++;
                     c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+
+                    //每个命名空间的统计信息
+                    c->thread->namespace_stats[it->namespace_key].touch_cmds++;
+                    c->thread->namespace_stats[it->namespace_key].slab_stats[ITEM_clsid(it)].touch_hits++;
                 } else {
                     c->thread->stats.lru_hits[it->slabs_clsid]++;
                     c->thread->stats.get_cmds++;
+
+                    c->thread->namespace_stats[it->namespace_key].lru_hits[it->slabs_clsid]++;
+                    c->thread->namespace_stats[it->namespace_key].get_cmds++;
                 }
                 pthread_mutex_unlock(&c->thread->stats.mutex);
 #ifdef EXTSTORE
@@ -3955,9 +3982,15 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 if (should_touch) {
                     c->thread->stats.touch_cmds++;
                     c->thread->stats.touch_misses++;
+
+                    c->thread->namespace_stats[it->namespace_key].touch_cmds++;
+                    c->thread->namespace_stats[it->namespace_key].touch_misses++;
                 } else {
                     c->thread->stats.get_misses++;
                     c->thread->stats.get_cmds++;
+
+                    c->thread->namespace_stats[it->namespace_key].get_misses++;
+                    c->thread->namespace_stats[it->namespace_key].get_cmds++;
                 }
                 MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
                 pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -4008,6 +4041,25 @@ stop:
     }
 }
 
+
+/**
+ * 对于拓展了命名空间的get命令，调整命令中的参数
+ *
+ * 1:将命令中key的部分改为namesapce_key+key
+ * 2:将命令中最后一个参数（namespace_key）置空
+ */
+static void process_namespace_token(token_t *tokens, const size_t ntokens) {
+    char *namespace_key = tokens[ntokens -2].value;
+    for(int i = 1; i < ntokens - 2; i++){
+        char *new_val =(char *) malloc(strlen(namespace_key) + strlen(tokens[i].value));
+        strcpy(new_val, namespace_key);
+        strcat(new_val, tokens[i].value);
+        tokens[i].value = new_val;
+        tokens[i].length = strlen(tokens[i].value);
+    }
+    tokens[ntokens-2].value = NULL;
+    tokens[ntokens-2].length = 0;
+}
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
     char *key;
     size_t nkey;
@@ -4017,6 +4069,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     int vlen;
     uint64_t req_cas_id=0;
     item *it;
+    int namespace_key;
 
     assert(c != NULL);
 
@@ -4027,8 +4080,10 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         return;
     }
 
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
+    //命名空间机制的实际key是namespace_key+key
+    key = strcat(tokens[ntokens-2].value, tokens[KEY_TOKEN].value);
+    nkey = tokens[KEY_TOKEN].length + tokens[ntokens-2].length;
+    namespace_key = atoi(tokens[ntokens-2].value);
 
     if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags)
            && safe_strtol(tokens[3].value, &exptime_int)
@@ -4064,7 +4119,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_set(key, nkey);
     }
 
-    it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
+    it = item_alloc(key, nkey, flags, realtime(exptime), vlen, namespace_key);
 
     if (it == 0) {
         enum store_item_type status;
@@ -4158,6 +4213,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
     uint64_t delta;
     char *key;
     size_t nkey;
+    int namespace_key;
 
     assert(c != NULL);
 
@@ -4170,13 +4226,14 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
 
     key = tokens[KEY_TOKEN].value;
     nkey = tokens[KEY_TOKEN].length;
+    namespace_key=0;
 
     if (!safe_strtoull(tokens[2].value, &delta)) {
         out_string(c, "CLIENT_ERROR invalid numeric delta argument");
         return;
     }
 
-    switch(add_delta(c, key, nkey, incr, delta, temp, NULL)) {
+    switch(add_delta(c, key, nkey, incr, delta, temp, NULL, namespace_key)) {
     case OK:
         out_string(c, temp);
         break;
@@ -4216,7 +4273,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
 enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
                                     const bool incr, const int64_t delta,
                                     char *buf, uint64_t *cas,
-                                    const uint32_t hv) {
+                                    const uint32_t hv, const int namespace_key) {
     char *ptr;
     uint64_t value;
     int res;
@@ -4290,7 +4347,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         item *new_it;
         uint32_t flags;
         FLAGS_CONV(settings.inline_ascii_response, it, flags);
-        new_it = do_item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, res + 2);
+        new_it = do_item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, res + 2, 0);
         if (new_it == 0) {
             do_item_remove(it);
             return EOM;
@@ -4372,6 +4429,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         out_string(c, "NOT_FOUND");
     }
 }
+
 
 static void process_verbosity_command(conn *c, token_t *tokens, const size_t ntokens) {
     unsigned int level;
@@ -4487,7 +4545,7 @@ static void process_memlimit_command(conn *c, token_t *tokens, const size_t ntok
     assert(c != NULL);
 
     set_noreply_maybe(c, tokens, ntokens);
-
+    int namespace_key = atoi(tokens[2].value);
     if (!safe_strtoul(tokens[1].value, &memlimit)) {
         out_string(c, "ERROR");
     } else {
@@ -4496,7 +4554,7 @@ static void process_memlimit_command(conn *c, token_t *tokens, const size_t ntok
         } else {
             if (memlimit > 1000000000) {
                 out_string(c, "MEMLIMIT_ADJUST_FAILED input value is megabytes not bytes");
-            } else if (slabs_adjust_mem_limit((size_t) memlimit * 1024 * 1024)) {
+            } else if (slabs_adjust_mem_limit((size_t) memlimit * 1024 * 1024, namespace_key)) {
                 if (settings.verbose > 0) {
                     fprintf(stderr, "maxbytes adjusted to %llum\n", (unsigned long long)memlimit);
                 }
@@ -4650,13 +4708,13 @@ static void process_command(conn *c, char *command) {
     }
 
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
-    if (ntokens >= 3 &&
+    if (ntokens >= 4 &&
         ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
          (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
+        process_namespace_token(tokens, ntokens);
+        process_get_command(c, tokens, ntokens-1, false, false);
 
-        process_get_command(c, tokens, ntokens, false, false);
-
-    } else if ((ntokens == 6 || ntokens == 7) &&
+    } else if ((ntokens == 7 || ntokens == 8) &&
                ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
@@ -5325,7 +5383,7 @@ static int read_into_chunked_item(conn *c) {
             } else {
                 /* Allocate next chunk. Binary protocol needs 2b for \r\n */
                 c->ritem = (char *) do_item_alloc_chunk(ch, c->rlbytes +
-                       ((c->protocol == binary_prot) ? 2 : 0));
+                       ((c->protocol == binary_prot) ? 2 : 0), 0);
                 if (!c->ritem) {
                     // We failed an allocation. Let caller handle cleanup.
                     total = -2;
@@ -5381,7 +5439,7 @@ static int read_into_chunked_item(conn *c) {
     if (c->rlbytes == 0 && c->protocol == binary_prot && total >= 0) {
         item_chunk *ch = (item_chunk *)c->ritem;
         if (ch->size - ch->used < 2) {
-            c->ritem = (char *) do_item_alloc_chunk(ch, 2);
+            c->ritem = (char *) do_item_alloc_chunk(ch, 2, 0);
             if (!c->ritem) {
                 total = -2;
             }
@@ -6157,7 +6215,8 @@ static void clock_handler(const int fd, const short which, void *arg) {
 #endif
 
     if (initialized) {
-        /* only delete the event if it's actually there. */
+        /* only delete the event if it's actslab_global_page_poolslab_global_page_pool
+         * ually there. */
         evtimer_del(&clockevent);
     } else {
         initialized = true;
